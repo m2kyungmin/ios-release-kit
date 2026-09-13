@@ -52,6 +52,52 @@ module AscDoctor
     end
   end
 
+  # «설정은 맞는데 StoreKit이 상품을 빈 배열로 돌려준다»는 커뮤니티 최다 질문 중 하나다.
+  # 우리가 확인할 수 있는 건 하나뿐이라 그것만 판정한다: 앱이 요청하는 productId가 ASC에 실제로 있는가.
+  # 나머지 원인(유료 앱 계약·전파 지연)은 API로 못 읽으므로 확인 순서만 안내한다.
+  # ASC의 상품 state 값은 그대로 출력만 하고 의미를 지어내지 않는다.
+
+  # .storekit 설정 파일에서 productID를 전부 긁어온다.
+  # products[] 와 subscriptionGroups[] 의 스키마를 각각 가정하지 않고 트리를 훑는다.
+  def self.local_product_ids(node, acc = [])
+    case node
+    when Hash
+      node.each do |k, v|
+        acc << v if k == "productID" && v.is_a?(String) && !v.strip.empty?
+        local_product_ids(v, acc)
+      end
+    when Array
+      node.each { |v| local_product_ids(v, acc) }
+    end
+    acc.uniq
+  end
+
+  def self.check_product_ids(iap_json, local_ids)
+    asc = (iap_json["data"] || []).map { |i| i.dig("attributes", "productId") }.compact.uniq
+    return Result.new("pid", "상품ID", :skip, ".storekit 설정 파일을 못 찾음(STOREKIT_CONFIG 미설정)", nil) if local_ids.nil?
+    return Result.new("pid", "상품ID", :skip, ".storekit에 상품 없음", nil) if local_ids.empty?
+
+    only_local = local_ids - asc
+    only_asc   = asc - local_ids
+
+    unless only_local.empty?
+      return Result.new("pid", "상품ID", :fail,
+                        ".storekit에만 있음: #{only_local.join(', ')} — ASC에 이 productId가 없어서 앱이 요청하면 빈 배열이 온다",
+                        "ASC에서 같은 productId로 상품을 만들거나, 앱·.storekit의 id를 ASC와 맞춘다")
+    end
+
+    msg = ".storekit #{local_ids.size}개 · ASC #{asc.size}개 · 전부 일치"
+    msg += " (ASC에만: #{only_asc.join(', ')})" unless only_asc.empty?
+    Result.new("pid", "상품ID", :ok, msg, nil)
+  end
+
+  # 상품ID가 맞는데도 빈 배열이면 남은 원인은 API로 못 읽는다. 순서만 안내한다.
+  def self.storekit_hint
+    Result.new("sk", "StoreKit", :skip,
+               "상품이 빈 배열로 오면 확인 순서: ① 위 상품ID 일치 ② 유료 앱 계약 활성(ASC 웹 › 비즈니스, API로 못 읽음) ③ ASC 변경 직후면 전파 지연",
+               nil)
+  end
+
   def self.check_age_rating(j)
     attrs = j.dig("data", "attributes") || {}
     missing = AGE_KEYS.select { |k| attrs[k].nil? }

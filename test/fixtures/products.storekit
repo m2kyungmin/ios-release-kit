@@ -1,0 +1,14 @@
+{
+  "identifier": "EXAMPLE-STOREKIT",
+  "products": [
+    { "productID": "com.example.app.unlock", "type": "NonConsumable", "referenceName": "Unlock",
+      "localizations": [{ "locale": "ko", "displayName": "해금", "description": "전체 기능" }] }
+  ],
+  "subscriptionGroups": [
+    { "name": "Pro", "subscriptions": [
+      { "productID": "com.example.app.pro.monthly", "referenceName": "Pro Monthly" },
+      { "productID": "com.example.app.pro.yearly",  "referenceName": "Pro Yearly" }
+    ]}
+  ],
+  "version": { "major": 3, "minor": 0 }
+}

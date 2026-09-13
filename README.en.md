@@ -5,7 +5,7 @@ Diagnose what is blocking your App Store submission via the App Store Connect AP
 ## 30-second summary
 **What**: diagnose why your submission is stuck (`fastlane doctor`), fix it with one command. **Who**: you shipped the app with Claude Code or Cursor and got stuck at submission.
 
-**Why** (a real Sept 2026 launch): missing IAP review screenshot blocked review; empty age-rating declaration blocked Submit; build never attached to the version so the draft lacked the app version; deliver crashed on a non-UTF-8 locale; review phone wasn't E.164; app name was already taken; every build asked the export-compliance question (no `ITSAppUsesNonExemptEncryption`); and after submitting, no way to tell whether the app was actually in Apple’s queue or just sitting in a draft.
+**Why** (a real Sept 2026 launch): missing IAP review screenshot blocked review; empty age-rating declaration blocked Submit; build never attached to the version so the draft lacked the app version; deliver crashed on a non-UTF-8 locale; review phone wasn't E.164; app name was already taken; every build asked the export-compliance question (no `ITSAppUsesNonExemptEncryption`); and after submitting, no way to tell whether the app was actually in Apple’s queue or just sitting in a draft; and `Product.products(for:)` returning an empty array with no way to tell whether the productId even exists in ASC.
 
 ## Install
 ```bash

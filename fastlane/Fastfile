@@ -192,6 +192,19 @@ def find_app!
 end
 
 desc "지금 제출을 막는 것을 ✅/❌로 진단한다. 쓰기 없음."
+
+# .storekit 설정 파일에서 productID 목록을 읽는다.
+# STOREKIT_CONFIG 로 경로를 주거나, 없으면 프로젝트에서 *.storekit 하나를 찾는다.
+# 못 찾으면 nil(진단은 skip 처리).
+def storekit_product_ids
+  path = ENV["STOREKIT_CONFIG"]
+  path = Dir.glob(File.join(__dir__, "..", "**", "*.storekit")).reject { |f| f.include?("/.build/") }.first if path.nil? || path.empty?
+  return nil if path.nil? || !File.exist?(path)
+  AscDoctor.local_product_ids(JSON.parse(File.read(path, encoding: "UTF-8")))
+rescue JSON::ParserError, Errno::ENOENT
+  nil
+end
+
 lane :doctor do
   results = []
   apps_json, app = find_app!
@@ -217,6 +230,8 @@ lane :doctor do
     end
     _, ij = asc.get("apps/#{id}/inAppPurchasesV2", "include" => "appStoreReviewScreenshot,inAppPurchaseLocalizations", "fields[inAppPurchases]" => "productId,state,appStoreReviewScreenshot,inAppPurchaseLocalizations")
     results.concat(AscDoctor.check_iaps(ij))
+    results << AscDoctor.check_product_ids(ij, storekit_product_ids)
+    results << AscDoctor.storekit_hint unless (ij["data"] || []).empty?
     _, aij = asc.get("apps/#{id}/appInfos", "fields[appInfos]" => "state")
     if (ai = (aij["data"] || []).first)
       _, dj = asc.get("appInfos/#{ai['id']}/ageRatingDeclaration")
