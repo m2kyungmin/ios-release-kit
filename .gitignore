@@ -1,0 +1,6 @@
+fastlane/.env
+fastlane/keys/
+fastlane/screenshots/
+fastlane/report.xml
+fastlane/README.md
+.DS_Store

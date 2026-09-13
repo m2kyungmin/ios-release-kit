@@ -1,0 +1,3 @@
+{"data":[{"type":"inAppPurchases","id":"1111","attributes":{"productId":"com.example.app.unlock","state":"MISSING_METADATA"},
+  "relationships":{"appStoreReviewScreenshot":{"data":null},"inAppPurchaseLocalizations":{"data":[{"type":"inAppPurchaseLocalizations","id":"l1"}]}}}],
+ "included":[{"type":"inAppPurchaseLocalizations","id":"l1","attributes":{"locale":"ko","name":"무제한","state":"APPROVED"}}]}

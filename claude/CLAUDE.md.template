@@ -1,0 +1,10 @@
+## App Store 출시 (ios-release-kit)
+
+이 프로젝트는 `fastlane/`에 ios-release-kit이 설치돼 있다.
+
+규칙:
+- fastlane 명령은 항상 `LC_ALL=en_US.UTF-8`을 앞에 붙여 실행한다. 안 그러면 `deliver`가 한글 메타데이터에서 죽는다.
+- ASC API 토큰을 파일로 저장하지 않는다. `.env`와 `fastlane/keys/`는 커밋 금지(이미 `.gitignore`에 있음).
+- 제출 전에는 반드시 `fastlane doctor`를 실행해 "제출 가능: 예"를 확인한다.
+- 심사 제출(`fastlane release`, ASC 웹 Submit)과 가격 변경은 사람이 승인한 뒤에만 실행한다. Claude가 임의로 제출하지 않는다.
+- 쓰기 레인(`attach_build`, `age_rating`, `iap_screenshot`)은 먼저 `DRY_RUN=1`로 요청 내용을 보여 주고, 사람이 확인한 뒤 실제로 실행한다.

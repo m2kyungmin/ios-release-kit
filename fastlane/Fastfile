@@ -1,0 +1,291 @@
+# ios-release-kit — App Store 출시 자동화 + 진단.
+# 실행 전: cp fastlane/.env.template fastlane/.env 후 값 채우기. 항상 LC_ALL=en_US.UTF-8.
+$LOAD_PATH.unshift(File.join(__dir__, "lib"))
+require "kit_env"
+require "asc_client"
+require "asc_doctor"
+KitEnv.load(File.join(__dir__, ".env"))
+
+default_platform(:ios)
+
+platform :ios do
+  desc "ASC API Key 인증만 검증(빌드 안 함)"
+  lane :verify_auth do
+    KitEnv.require!("BUNDLE_ID")
+    key = asc_key
+    build_num = latest_testflight_build_number(api_key: key, app_identifier: ENV["BUNDLE_ID"])
+    UI.success "✅ ASC 인증 OK — TestFlight 최신 빌드: #{build_num}"
+  end
+
+  desc "ASC 앱 레코드 생성(App Store Connect 앱). 최초 1회. produce가 API 키만으론"
+  desc "username을 요구해 실패하므로 ConnectAPI로 직접 생성한다(순수 API 키)."
+  lane :create_app do
+    KitEnv.require!("BUNDLE_ID", "APP_NAME", "APP_SKU", "TEAM_ID")
+    require 'spaceship'
+    Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.from(hash: asc_key)
+
+    if (existing = Spaceship::ConnectAPI::App.find(ENV["BUNDLE_ID"]))
+      UI.success "✅ 앱 레코드 이미 존재: #{existing.name} (#{ENV['BUNDLE_ID']}) — beta 업로드 준비됨"
+    else
+      # App ID(Bundle ID resource) 등록은 API 키로 가능 — 없으면 등록(idempotent).
+      bundle = Spaceship::ConnectAPI::BundleId.find(ENV["BUNDLE_ID"])
+      if bundle.nil?
+        bundle = Spaceship::ConnectAPI::BundleId.create(name: ENV["APP_NAME"], identifier: ENV["BUNDLE_ID"], platform: "IOS", seed_id: ENV["TEAM_ID"])
+        UI.success "App ID 등록됨: #{bundle.identifier} (#{bundle.id})"
+      else
+        UI.message "App ID 이미 등록됨: #{bundle.identifier} (#{bundle.id})"
+      end
+      # ⚠️ Apple ASC API는 앱 레코드 CREATE를 허용하지 않는다(apps=GET/UPDATE만).
+      # 앱 레코드 생성은 ASC 웹 또는 Apple ID 로그인(produce) 전용 — 사람 1회 단계.
+      UI.important "앱 레코드는 ASC 웹에서 생성하세요:"
+      UI.important "  App Store Connect → My Apps → + New App → iOS"
+      UI.important "  이름: #{ENV['APP_NAME']} · 기본 언어: Korean · 번들: #{ENV['BUNDLE_ID']} · SKU: #{ENV['APP_SKU']}"
+      UI.important "생성 후 `fastlane beta`로 빌드+TestFlight 업로드."
+    end
+  end
+
+  desc "빌드 + TestFlight 업로드(빌드 번호 자동 +1)"
+  lane :beta do
+    KitEnv.require!("BUNDLE_ID", "SCHEME", "PROJECT", "TEAM_ID")
+    key = asc_key
+    # 새 앱은 읽을 TestFlight 빌드가 없어 latest_testflight_build_number가 실패할 수
+    # 있다 -> 없으면 1로 시드. 이후 업로드부터는 최신+1.
+    next_build = (latest_testflight_build_number(api_key: key, app_identifier: ENV["BUNDLE_ID"], initial_build_number: 0) rescue 0) + 1
+    increment_build_number(xcodeproj: ENV["PROJECT"], build_number: next_build)
+    UI.success "📦 새 빌드 번호: #{next_build}"
+
+    # 아카이브는 automatic 개발 서명으로 진행되고, export가 app-store 배포 프로파일을
+    # 자동 매핑하지 못한다("no provisioning profile mapping"). 그래서 App Store 프로파일을
+    # 명시적으로 만들고(sigh) export를 manual 서명으로 지정한다(export가 재서명).
+    # __dir__ = this Fastfile's dir(=fastlane/); 절대경로로 고정(cwd 무관).
+    key_path = ENV["ASC_KEY_FILEPATH"] ? File.expand_path(ENV["ASC_KEY_FILEPATH"]) :
+               File.expand_path("keys/AuthKey_#{ENV['ASC_KEY_ID']}.p8", __dir__)
+    UI.user_error!("API 키 파일 없음: #{key_path}") unless File.exist?(key_path)
+    auth = "-allowProvisioningUpdates -authenticationKeyPath #{key_path} " \
+           "-authenticationKeyID #{ENV['ASC_KEY_ID']} -authenticationKeyIssuerID #{ENV['ASC_ISSUER_ID']}"
+
+    # sigh 반환값 = 프로파일 이름. 비거나 경로면 sigh의 결정적 기본 이름으로 폴백.
+    prof_name = sigh(api_key: key, app_identifier: ENV["BUNDLE_ID"], platform: "ios")   # 기본 타입=App Store
+    prof_name = "#{ENV['BUNDLE_ID']} AppStore" if prof_name.to_s.empty? || prof_name.to_s.include?("/")
+    UI.message "App Store 프로파일: #{prof_name}"
+
+    build_app(scheme: ENV["SCHEME"], project: ENV["PROJECT"], export_method: "app-store", clean: true,
+              xcargs: auth,
+              export_options: {
+                signingStyle: "manual",
+                teamID: ENV["TEAM_ID"],
+                provisioningProfiles: { ENV["BUNDLE_ID"] => prof_name }
+              })
+    upload_to_testflight(
+      api_key: key,
+      skip_waiting_for_build_processing: true,
+      changelog: ENV["TF_CHANGELOG"] || "내부 테스트 빌드"
+    )
+    # 빌드번호 bump는 커밋만(자동 push X).
+    sh("cd .. && git add #{ENV['PROJECT']}/project.pbxproj || true")
+    sh("cd .. && git commit -m 'chore(release): bump build number' || true")
+  end
+
+  desc "ASC 메타데이터 업로드(제출은 안 함 — ASC web에서 수동 Submit)."
+  desc "fastlane/metadata.example/ 을 fastlane/metadata/ 로 복사해 채운 뒤 실행한다."
+  lane :release_metadata do
+    KitEnv.require!("BUNDLE_ID")
+    key = asc_key
+    upload_to_app_store(
+      api_key: key,
+      app_identifier: ENV["BUNDLE_ID"],
+      build_number: latest_testflight_build_number(api_key: key, app_identifier: ENV["BUNDLE_ID"]).to_s,
+      submit_for_review: false,
+      automatic_release: false,
+      force: true,
+      skip_binary_upload: true,
+      skip_screenshots: true,        # 스크린샷은 upload_screenshots가 처리
+      skip_metadata: false,
+      metadata_path: "fastlane/metadata",
+      precheck_include_in_app_purchases: false
+    )
+    UI.success "✅ 메타데이터 업로드 완료. ASC web에서 검토 후 Submit."
+  end
+
+  desc "스크린샷 ASC 직접 업로드(deliver silent-skip 버그 우회). fastlane/screenshots/<locale>/<device>/*.png 규칙으로 PNG를 넣어둘 것."
+  lane :upload_screenshots do
+    KitEnv.require!("BUNDLE_ID")
+    require 'spaceship'
+    key = asc_key
+    Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.from(hash: key)
+    app = Spaceship::ConnectAPI::App.find(ENV["BUNDLE_ID"])
+    UI.user_error!("App not found") unless app
+    version = app.get_edit_app_store_version(platform: Spaceship::ConnectAPI::Platform::IOS)
+    UI.user_error!("편집 가능한 버전 없음(PREPARE_FOR_SUBMISSION 상태여야)") unless version
+    all_locs = version.get_app_store_version_localizations
+    # 6.3"=1206x2622 → APP_IPHONE_61, 6.9"=1320x2868 → APP_IPHONE_67,
+    # iPad 12.9"/13"=2048x2732 → APP_IPAD_PRO_3GEN_129
+    device_map = { "iPhone 17"           => "APP_IPHONE_61",
+                   "iPhone 17 Pro Max"   => "APP_IPHONE_67",
+                   "iPad Pro (12.9-inch)" => "APP_IPAD_PRO_3GEN_129" }
+    ss_root = File.join(File.dirname(__FILE__), "..", "fastlane", "screenshots")
+    # screenshots/<locale>/<device>/ 를 자동 탐색해 활성 로케일에만 업로드.
+    Dir.glob(File.join(ss_root, "*")).select { |d| File.directory?(d) }.each do |locale_dir|
+      locale = File.basename(locale_dir)
+      loc = all_locs.find { |l| l.locale == locale }
+      unless loc
+        UI.important "⏭️  #{locale}: ASC 버전에 없는 로케일 — 건너뜀"
+        next
+      end
+      device_map.each do |device_name, display_type|
+        pngs = Dir.glob(File.join(locale_dir, device_name, "*.png")).sort
+        next if pngs.empty?
+        UI.header "📱 #{locale} · #{device_name} → #{display_type}"
+        set = loc.get_app_screenshot_sets(includes: "appScreenshots").find { |s| s.screenshot_display_type == display_type }
+        if set then (set.app_screenshots || []).each(&:delete!)
+        else set = loc.create_app_screenshot_set(attributes: { screenshotDisplayType: display_type }) end
+        pngs.each { |p| set.upload_screenshot(path: p, wait_for_processing: false); UI.success "  ✅ #{File.basename(p)}" }
+      end
+    end
+    UI.header "🎉 스크린샷 업로드 완료"
+  end
+
+  desc "심사 자동 제출 + 자동 release(v1.1+ 권장). 첫 출시는 release_metadata + ASC web 수동 Submit."
+  lane :release do
+    KitEnv.require!("BUNDLE_ID")
+    key = asc_key
+    upload_to_app_store(
+      api_key: key,
+      app_identifier: ENV["BUNDLE_ID"],
+      build_number: latest_testflight_build_number(api_key: key, app_identifier: ENV["BUNDLE_ID"]).to_s,
+      submit_for_review: true,
+      automatic_release: true,
+      phased_release: true,
+      force: true,
+      skip_binary_upload: true,
+      skip_screenshots: true,
+      skip_metadata: false,
+      metadata_path: "fastlane/metadata",
+      precheck_include_in_app_purchases: false,
+      submission_information: {
+        add_id_info_uses_idfa: false,
+        export_compliance_uses_encryption: false,
+        export_compliance_encryption_updated: false
+      }
+    )
+    UI.success "🚀 제출 완료. 심사 1-3일 후 자동 release."
+  end
+end
+
+def asc_key
+  KitEnv.require!("ASC_KEY_ID", "ASC_ISSUER_ID", "ASC_KEY_FILEPATH")
+  app_store_connect_api_key(key_id: ENV["ASC_KEY_ID"], issuer_id: ENV["ASC_ISSUER_ID"], key_filepath: ENV["ASC_KEY_FILEPATH"])
+end
+
+# JWT는 메모리에만. 로그엔 키 ID 앞 4자만 남긴다.
+def asc_token
+  require "spaceship"
+  Spaceship::ConnectAPI::Token.from(hash: asc_key).text
+end
+
+def asc = @asc ||= AscClient.new(asc_token)
+
+def find_app!
+  KitEnv.require!("BUNDLE_ID")
+  _, j = asc.get("apps", "filter[bundleId]" => ENV["BUNDLE_ID"], "fields[apps]" => "name,bundleId")
+  [j, (j["data"] || []).first]
+end
+
+desc "지금 제출을 막는 것을 ✅/❌로 진단한다. 쓰기 없음."
+lane :doctor do
+  results = []
+  apps_json, app = find_app!
+  results << AscDoctor.check_app(apps_json)
+  if app
+    id = app["id"]
+    _, vj = asc.get("apps/#{id}/appStoreVersions", "filter[platform]" => "IOS", "fields[appStoreVersions]" => "versionString,appStoreState", "limit" => 1)
+    results << AscDoctor.check_version(vj)
+    if (v = (vj["data"] || []).first)
+      _, bj = asc.get("appStoreVersions/#{v['id']}/build", "fields[builds]" => "version,processingState")
+      results << AscDoctor.check_build(bj)
+      _, rj = asc.get("appStoreVersions/#{v['id']}/appStoreReviewDetail", "fields[appStoreReviewDetails]" => "contactFirstName,contactLastName,contactEmail,contactPhone")
+      results << AscDoctor.check_review_detail(rj)
+      _, lj = asc.get("appStoreVersions/#{v['id']}/appStoreVersionLocalizations", "fields[appStoreVersionLocalizations]" => "locale,description,keywords,supportUrl")
+      results << AscDoctor.check_metadata(lj)
+      if (loc = (lj["data"] || []).first)
+        _, sj = asc.get("appStoreVersionLocalizations/#{loc['id']}/appScreenshotSets", "include" => "appScreenshots", "fields[appScreenshotSets]" => "screenshotDisplayType,appScreenshots")
+        results << AscDoctor.check_screenshots(sj)
+      end
+      _, subj = asc.get("reviewSubmissions", "filter[app]" => id, "filter[platform]" => "IOS", "include" => "items", "fields[reviewSubmissions]" => "state,submittedDate,items", "fields[reviewSubmissionItems]" => "state,appStoreVersion")
+      results << AscDoctor.check_submission(subj, v["id"])
+      results << AscDoctor.check_review_progress(subj)
+    end
+    _, ij = asc.get("apps/#{id}/inAppPurchasesV2", "include" => "appStoreReviewScreenshot,inAppPurchaseLocalizations", "fields[inAppPurchases]" => "productId,state,appStoreReviewScreenshot,inAppPurchaseLocalizations")
+    results.concat(AscDoctor.check_iaps(ij))
+    _, aij = asc.get("apps/#{id}/appInfos", "fields[appInfos]" => "state")
+    if (ai = (aij["data"] || []).first)
+      _, dj = asc.get("appInfos/#{ai['id']}/ageRatingDeclaration")
+      results << AscDoctor.check_age_rating(dj)
+      _, pj = asc.get("appInfos/#{ai['id']}/appInfoLocalizations", "fields[appInfoLocalizations]" => "locale,privacyPolicyUrl")
+      results << AscDoctor.check_privacy_url(pj)
+    end
+  end
+  results << AscDoctor.check_encryption(ENV["INFO_PLIST"])
+  results << AscDoctor.check_paid_agreement
+  puts AscDoctor.format(results)
+end
+
+desc "버전·제출·IAP 상태 한 줄씩(매일 점검용)"
+lane :review_status do
+  _, app = find_app!
+  UI.user_error!("앱 없음: #{ENV['BUNDLE_ID']}") unless app
+  _, v = asc.get("apps/#{app['id']}/appStoreVersions", "filter[platform]" => "IOS", "fields[appStoreVersions]" => "versionString,appStoreState", "limit" => 1)
+  _, s = asc.get("reviewSubmissions", "filter[app]" => app["id"], "fields[reviewSubmissions]" => "state,submittedDate", "limit" => 2)
+  _, i = asc.get("apps/#{app['id']}/inAppPurchasesV2", "fields[inAppPurchases]" => "productId,state")
+  UI.message "버전: #{v.dig('data', 0, 'attributes')&.values&.join(' · ')}"
+  UI.message "제출: #{(s['data'] || []).map { |d| d['attributes'].values.join(' · ') }.join(' | ')}"
+  UI.message "IAP: #{(i['data'] || []).map { |d| d['attributes'].values.join(' ') }.join(' | ')}"
+end
+
+require "iap_screenshot"
+
+desc "최신 VALID 빌드를 편집 중인 버전에 첨부. 옵션 build:<빌드번호>. DRY_RUN=1이면 요청만 출력"
+lane :attach_build do |opts|
+  _, app = find_app!
+  UI.user_error!("앱 없음") unless app
+  _, vj = asc.get("apps/#{app['id']}/appStoreVersions", "filter[platform]" => "IOS", "filter[appStoreState]" => "PREPARE_FOR_SUBMISSION,DEVELOPER_REJECTED,REJECTED,METADATA_REJECTED", "limit" => 1)
+  v = (vj["data"] || []).first or UI.user_error!("편집 가능한 버전 없음")
+  params = { "filter[app]" => app["id"], "filter[processingState]" => "VALID", "sort" => "-uploadedDate", "limit" => 1, "fields[builds]" => "version,processingState" }
+  params["filter[version]"] = opts[:build] if opts[:build]
+  _, bj = asc.get("builds", params)
+  b = (bj["data"] || []).first or UI.user_error!("VALID 빌드 없음(처리 중이면 몇 분 뒤)")
+  code, body = asc.patch("appStoreVersions/#{v['id']}/relationships/build", { data: { type: "builds", id: b["id"] } })
+  UI.message "빌드 #{b.dig('attributes', 'version')} → 버전 #{v.dig('attributes', 'versionString')}: HTTP #{code} #{body['dry_run'] ? body.to_json : ''}"
+end
+
+desc "연령등급 선언을 전부 NONE/false로 채운다. override:'gambling=true,contests=INFREQUENT_OR_MILD' 로 덮어쓰기"
+lane :age_rating do |opts|
+  _, app = find_app!
+  UI.user_error!("앱 없음") unless app
+  _, aij = asc.get("apps/#{app['id']}/appInfos")
+  ai = (aij["data"] || []).first or UI.user_error!("appInfo 없음")
+  _, dj = asc.get("appInfos/#{ai['id']}/ageRatingDeclaration")
+  decl_id = dj.dig("data", "id") or UI.user_error!("ageRatingDeclaration 없음")
+  attrs = AscDoctor::AGE_KEYS.to_h { |k| [k, %w[gambling unrestrictedWebAccess seventeenPlus lootBox advertising ageAssurance parentalControls healthOrWellnessTopics messagingAndChat userGeneratedContent].include?(k) ? false : "NONE"] }
+  (opts[:override] || "").split(",").each do |kv|
+    k, val = kv.split("=", 2); next unless k && val
+    attrs[k.strip] = case val.strip when "true" then true when "false" then false else val.strip end
+  end
+  code, body = asc.patch("ageRatingDeclarations/#{decl_id}", { data: { type: "ageRatingDeclarations", id: decl_id, attributes: attrs } })
+  UI.message "연령등급 선언: HTTP #{code} #{body['dry_run'] ? body.to_json : (body['errors'] || 'OK')}"
+end
+
+desc "IAP 심사 스크린샷 업로드. iap_id:<ASC id> path:<png>. iap_id 없으면 productId로 찾음: product_id:<id>"
+lane :iap_screenshot do |opts|
+  iap_id = opts[:iap_id]
+  if iap_id.nil? && opts[:product_id]
+    _, app = find_app!
+    UI.user_error!("앱 없음") unless app
+    _, ij = asc.get("apps/#{app['id']}/inAppPurchasesV2", "fields[inAppPurchases]" => "productId")
+    iap_id = (ij["data"] || []).find { |d| d.dig("attributes", "productId") == opts[:product_id] }&.dig("id")
+  end
+  UI.user_error!("iap_id 또는 product_id 필요") unless iap_id
+  UI.user_error!("path:<png> 필요") unless opts[:path] && File.exist?(opts[:path])
+  r = IapScreenshot.upload(asc, iap_id: iap_id, png_path: opts[:path])
+  UI.message "스크린샷 #{r['id']} 청크 #{r['chunks']} 상태 #{r['state']}"
+end

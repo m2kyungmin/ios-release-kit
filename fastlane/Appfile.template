@@ -1,0 +1,2 @@
+# 복사해서 fastlane/Appfile 로. 값은 .env에서 읽으므로 보통 비워 둬도 된다.
+app_identifier(ENV["BUNDLE_ID"])
