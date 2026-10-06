@@ -14,8 +14,6 @@ Diagnose what is blocking your App Store submission via the App Store Connect AP
 - 심사 연락처 전화번호 형식(E.164) 오류
 - 앱 이름이 이미 선점돼 있어 앱 생성 단계에서야 발견됨
 - 빌드마다 수출 규정(암호화) 질문이 뜸(`ITSAppUsesNonExemptEncryption` 없음)
-- 제출한 뒤 며칠째 상태가 그대로인데, 큐에 들어가 있기는 한 건지 알 수 없음
-- 설정은 맞는데 `Product.products(for:)`가 빈 배열을 돌려줌
 
 **누구**: Claude Code나 Cursor로 앱은 다 만들었는데 출시 단계에서 막힌 사람.
 
@@ -42,15 +40,10 @@ LC_ALL=en_US.UTF-8 fastlane doctor
 ✅ 버전    1.0 · PREPARE_FOR_SUBMISSION
 ❌ IAP     com.example.app.pro MISSING_METADATA: 심사 스크린샷 없음 → fastlane iap_screenshot iap_id:abc123 path:<png>
 ❌ 연령등급 선언 항목 3개 비어 있음 → fastlane age_rating
-✅ 심사진행 애플 큐에서 대기 3일째 · 제출 2026-09-11 18:32 (WAITING_FOR_REVIEW)
-✅ 상품ID  .storekit 1개 · ASC 1개 · 전부 일치
-– StoreKit 상품이 빈 배열로 오면 확인 순서: ① 위 상품ID 일치 ② 유료 앱 계약 활성 ③ 전파 지연
 – 제출초안 제출 초안 없음
 – 유료계약 API로 못 읽음. 유료 IAP면 ASC 웹 › 비즈니스 › 유료 앱 계약 활성 확인
 ❌ 2개 · 제출 가능: 아니오
 ```
-
-`.storekit` 설정 파일은 프로젝트에서 자동으로 찾는다. 여러 개면 `STOREKIT_CONFIG=<경로>`로 지정한다.
 
 ## 고치기
 
@@ -82,8 +75,6 @@ scripts/screenshots.sh booted fastlane/screenshots/ko/iPhone 01-home
 ```
 
 시뮬레이터 상태바를 정리하고 캡처한 뒤 1320×2868(6.9인치)로 맞춘다.
-
-UI로 찍지 않고 CLI로 찍는 이유가 있다. 시뮬레이터 창 위로 마우스를 옮기는 것만으로 홈 인디케이터나 시계 UI가 살아나서 스크린샷에 섞여 들어간다. `simctl`로 캡처하면 포인터가 기기 화면 근처에 갈 일이 없고, 상태바도 `simctl status_bar override`로 고정되며, 해상도도 ASC가 원하는 네이티브로 나온다.
 
 ## Claude Code와 쓰기
 
