@@ -1,3 +1,5 @@
+require "time"
+
 # 순수 진단 함수. 네트워크 없음. 입력은 ASC 응답을 JSON.parse한 해시.
 module AscDoctor
   Result = Struct.new(:id, :label, :status, :message, :fix)
@@ -11,7 +13,7 @@ module AscDoctor
     parentalControls healthOrWellnessTopics messagingAndChat userGeneratedContent
   ].freeze
 
-  ICON = { ok: "✅", fail: "❌", skip: "–" }.freeze
+  ICON = { ok: "✅", fail: "❌", warn: "⚠️", skip: "–" }.freeze
 
   def self.check_app(j)
     a = (j["data"] || []).first
@@ -48,6 +50,52 @@ module AscDoctor
         Result.new("iap", "IAP", :ok, "#{pid} #{st}", nil)
       end
     end
+  end
+
+  # «설정은 맞는데 StoreKit이 상품을 빈 배열로 돌려준다»는 커뮤니티 최다 질문 중 하나다.
+  # 우리가 확인할 수 있는 건 하나뿐이라 그것만 판정한다: 앱이 요청하는 productId가 ASC에 실제로 있는가.
+  # 나머지 원인(유료 앱 계약·전파 지연)은 API로 못 읽으므로 확인 순서만 안내한다.
+  # ASC의 상품 state 값은 그대로 출력만 하고 의미를 지어내지 않는다.
+
+  # .storekit 설정 파일에서 productID를 전부 긁어온다.
+  # products[] 와 subscriptionGroups[] 의 스키마를 각각 가정하지 않고 트리를 훑는다.
+  def self.local_product_ids(node, acc = [])
+    case node
+    when Hash
+      node.each do |k, v|
+        acc << v if k == "productID" && v.is_a?(String) && !v.strip.empty?
+        local_product_ids(v, acc)
+      end
+    when Array
+      node.each { |v| local_product_ids(v, acc) }
+    end
+    acc.uniq
+  end
+
+  def self.check_product_ids(iap_json, local_ids)
+    asc = (iap_json["data"] || []).map { |i| i.dig("attributes", "productId") }.compact.uniq
+    return Result.new("pid", "상품ID", :skip, ".storekit 설정 파일을 못 찾음(STOREKIT_CONFIG 미설정)", nil) if local_ids.nil?
+    return Result.new("pid", "상품ID", :skip, ".storekit에 상품 없음", nil) if local_ids.empty?
+
+    only_local = local_ids - asc
+    only_asc   = asc - local_ids
+
+    unless only_local.empty?
+      return Result.new("pid", "상품ID", :fail,
+                        ".storekit에만 있음: #{only_local.join(', ')} — ASC에 이 productId가 없어서 앱이 요청하면 빈 배열이 온다",
+                        "ASC에서 같은 productId로 상품을 만들거나, 앱·.storekit의 id를 ASC와 맞춘다")
+    end
+
+    msg = ".storekit #{local_ids.size}개 · ASC #{asc.size}개 · 전부 일치"
+    msg += " (ASC에만: #{only_asc.join(', ')})" unless only_asc.empty?
+    Result.new("pid", "상품ID", :ok, msg, nil)
+  end
+
+  # 상품ID가 맞는데도 빈 배열이면 남은 원인은 API로 못 읽는다. 순서만 안내한다.
+  def self.storekit_hint
+    Result.new("sk", "StoreKit", :skip,
+               "상품이 빈 배열로 오면 확인 순서: ① 위 상품ID 일치 ② 유료 앱 계약 활성(ASC 웹 › 비즈니스, API로 못 읽음) ③ ASC 변경 직후면 전파 지연",
+               nil)
   end
 
   def self.check_age_rating(j)
@@ -90,10 +138,66 @@ module AscDoctor
     Result.new("privacy", "개인정보", :ok, url, nil)
   end
 
-  def self.check_encryption(path)
+  # 수출 규정(암호화). Info.plist 값을 읽고, 소스에서 암호화 API를 훑어 신고 값과 어긋나 보이면 경고한다.
+  # 면제 여부는 판정하지 않는다(법적 판단). 어디를 확인할지만 짚는다.
+  CIPHER_APIS = ["AES.GCM", "ChaChaPoly", "AES.KeyWrap", "HPKE", "SecKeyCreateEncryptedData", "CCCrypt"].freeze
+  HASH_APIS = ["Insecure.MD5", "Insecure.SHA1", "SHA256", "SHA384", "SHA512", "HMAC<", "CC_MD5", "CC_SHA"].freeze
+  SCAN_SKIP_DIRS = %w[Pods Carthage DerivedData build node_modules vendor fastlane].freeze
+
+  # :yes / :no / :missing / :unknown(키는 있는데 값이 <true/>·<false/>가 아님)
+  def self.plist_encryption_value(text)
+    return :missing unless text.include?("ITSAppUsesNonExemptEncryption")
+    m = text.match(%r{<key>\s*ITSAppUsesNonExemptEncryption\s*</key>\s*<(true|false)\s*/>}m)
+    return :unknown unless m
+    m[1] == "true" ? :yes : :no
+  end
+
+  # 소스(.swift/.m/.mm)에서 암호화·해시 API가 쓰인 줄. 주석 줄과 의존성 폴더는 뺀다.
+  def self.scan_crypto(root)
+    hits = { cipher: [], hash: [] }
+    return hits if root.nil? || !Dir.exist?(root)
+    base = File.expand_path(root)
+    Dir.glob(File.join(base, "**", "*.{swift,m,mm}")).sort.each do |f|
+      rel = f.delete_prefix("#{base}/")
+      next if rel.split("/")[0..-2].any? { |d| SCAN_SKIP_DIRS.include?(d) }
+      File.foreach(f, encoding: "UTF-8").with_index(1) do |line, n|
+        s = line.scrub.strip
+        next if s.start_with?("//", "*", "/*")
+        if (api = CIPHER_APIS.find { |a| s.include?(a) })
+          hits[:cipher] << "#{rel}:#{n} #{api}"
+        elsif (api = HASH_APIS.find { |a| s.include?(a) })
+          hits[:hash] << "#{rel}:#{n} #{api}"
+        end
+      end
+    end
+    hits
+  end
+
+  def self.list_hits(items, max = 3)
+    items.first(max).join(", ") + (items.size > max ? " 외 #{items.size - max}곳" : "")
+  end
+
+  # path: Info.plist, src_root: 훑을 소스 폴더(nil이면 소스 검사 생략), uses_env: .env의 USES_ENCRYPTION 원문
+  def self.check_encryption(path, src_root = nil, uses_env = nil)
     return Result.new("enc", "암호화", :skip, "Info.plist 경로 없음(INFO_PLIST 미설정)", nil) if path.nil? || !File.exist?(path)
-    return Result.new("enc", "암호화", :ok, "ITSAppUsesNonExemptEncryption 있음", nil) if File.read(path, encoding: "UTF-8").include?("ITSAppUsesNonExemptEncryption")
-    Result.new("enc", "암호화", :fail, "Info.plist에 ITSAppUsesNonExemptEncryption 없음(빌드마다 수출 규정 질문 뜸)", "Info.plist에 ITSAppUsesNonExemptEncryption=false 추가")
+    v = plist_encryption_value(File.read(path, encoding: "UTF-8"))
+    return Result.new("enc", "암호화", :fail, "Info.plist에 ITSAppUsesNonExemptEncryption 없음(빌드마다 수출 규정 질문 뜸)", "Info.plist에 ITSAppUsesNonExemptEncryption=false 추가") if v == :missing
+    return Result.new("enc", "암호화", :fail, "ITSAppUsesNonExemptEncryption 값을 못 읽음(<true/>·<false/>가 아님)", "Info.plist에서 값 확인") if v == :unknown
+    env_yes = uses_env.to_s.strip.downcase == "true"
+    if v == :yes
+      return Result.new("enc", "암호화", :warn, "Info.plist는 YES인데 submit 레인은 USES_ENCRYPTION=false로 보냄", ".env에 USES_ENCRYPTION=true") unless env_yes
+      return Result.new("enc", "암호화", :ok, "YES(암호화 사용) 선언 · ASC에서 수출 규정 서류 요구 여부 확인", nil)
+    end
+    return Result.new("enc", "암호화", :warn, "Info.plist는 NO인데 .env는 USES_ENCRYPTION=true", "둘 중 하나로 맞추기") if env_yes
+    hits = scan_crypto(src_root)
+    unless hits[:cipher].empty?
+      return Result.new("enc", "암호화", :warn,
+                        "NO로 신고했는데 데이터 암호화 API가 보임: #{list_hits(hits[:cipher])}",
+                        "면제 대상인지 Apple 수출 규정 문서로 확인. 아니면 Info.plist를 YES로 + .env에 USES_ENCRYPTION=true")
+    end
+    msg = "NO"
+    msg += src_root.nil? ? " · 소스 검사 안 함" : (hits[:hash].empty? ? " · 소스에 암호화 API 없음" : " · 해시만 보임(#{list_hits(hits[:hash], 2)})")
+    Result.new("enc", "암호화", :ok, msg, nil)
   end
 
   def self.check_submission(j, version_id)
@@ -106,6 +210,58 @@ module AscDoctor
     Result.new("submit", "제출초안", :fail, "제출 초안에 앱 버전이 빠짐(이 상태로 제출하면 IAP만 감)", "ASC 웹 › 심사 제출 › 항목 추가 › 앱 버전")
   end
 
+  # 심사 제출은 됐는데 그 다음이 안 보일 때. 커뮤니티 1위 질문("내 대기가 정상인가")에 대한 답은
+  # "정상/비정상"이 아니라 ① 지금 애플 큐에 들어가 있기는 한가 ② 들어갔다면 며칠째인가 두 가지다.
+  QUEUE_STATES = %w[WAITING_FOR_REVIEW IN_REVIEW].freeze
+  DRAFT_STATES = %w[READY_FOR_REVIEW UNRESOLVED_ISSUES].freeze
+  DONE_STATES  = %w[COMPLETING COMPLETE].freeze
+  INQUIRY_DAYS = 7
+
+  def self.elapsed_label(from, now)
+    secs = now.to_i - from.to_i
+    return "방금" if secs < 0
+    secs < 86_400 ? "#{secs / 3600}시간째" : "#{secs / 86_400}일째"
+  end
+
+  def self.latest_submission(subs)
+    subs.max_by { |d| Time.iso8601(d.dig("attributes", "submittedDate").to_s).to_i rescue 0 }
+  end
+
+  def self.check_review_progress(j, now = Time.now)
+    subs = j["data"] || []
+    if subs.empty?
+      return Result.new("progress", "심사진행", :skip,
+                        "심사에 제출한 이력 없음 — 애플 큐에 들어가 있지 않다", nil)
+    end
+
+    sub = latest_submission(subs)
+    state = sub.dig("attributes", "state").to_s
+    raw   = sub.dig("attributes", "submittedDate").to_s
+
+    if DRAFT_STATES.include?(state)
+      note = state == "UNRESOLVED_ISSUES" ? "해결 안 된 항목이 있어 제출이 막혀 있다" : "제출 초안만 만들어져 있고 아직 제출되지 않았다"
+      return Result.new("progress", "심사진행", :skip,
+                        "아직 애플 큐에 없음(#{state}) — #{note}", "위 항목들을 먼저 해결한 뒤 ASC 웹 › 심사 제출")
+    end
+
+    submitted = (Time.iso8601(raw) rescue nil)
+    if submitted.nil?
+      return Result.new("progress", "심사진행", :ok, "상태 #{state}(제출 시각 없음)", nil)
+    end
+
+    stamp = submitted.getlocal.strftime("%Y-%m-%d %H:%M")
+    days  = (now.to_i - submitted.to_i) / 86_400
+
+    if DONE_STATES.include?(state)
+      return Result.new("progress", "심사진행", :ok, "심사 종료(#{state}) · 제출 #{stamp}", nil)
+    end
+
+    label = state == "IN_REVIEW" ? "심사 중" : "애플 큐에서 대기"
+    msg   = "#{label} #{elapsed_label(submitted, now)} · 제출 #{stamp} (#{state})"
+    fix   = days >= INQUIRY_DAYS ? "#{INQUIRY_DAYS}일 넘음 — ASC 웹 › 문의하기 › App Review로 상태 문의 가능" : nil
+    Result.new("progress", "심사진행", :ok, msg, fix)
+  end
+
   def self.check_paid_agreement
     Result.new("paid", "유료계약", :skip, "API로 못 읽음. 유료 IAP면 ASC 웹 › 비즈니스 › 유료 앱 계약 활성 확인", nil)
   end
@@ -113,6 +269,8 @@ module AscDoctor
   def self.format(results)
     lines = results.map { |r| "#{ICON[r.status]} #{r.label.ljust(6)} #{r.message}#{r.fix ? " → #{r.fix}" : ''}" }
     fails = results.count { |r| r.status == :fail }
+    warns = results.count { |r| r.status == :warn }
+    lines << "⚠️ #{warns}개 확인 필요(제출은 막지 않음)" if warns.positive?
     lines << "❌ #{fails}개 · 제출 가능: #{fails.zero? ? '예' : '아니오'}"
     lines.join("\n")
   end

@@ -1,6 +1,8 @@
 require "minitest/autorun"
 require "json"
 require "asc_doctor"
+require "tmpdir"
+require "fileutils"
 
 class AscDoctorTest < Minitest::Test
   def fx(name) = JSON.parse(File.read(File.join(__dir__, "fixtures", name), encoding: "UTF-8"))
@@ -82,5 +84,65 @@ class AscDoctorTest < Minitest::Test
     assert_includes out, "❌ 빌드"
     assert_includes out, "→ fastlane attach_build"
     assert_includes out, "❌ 1개 · 제출 가능: 아니오"
+  end
+
+  PLIST_NO = "<dict>\n<key>ITSAppUsesNonExemptEncryption</key>\n<false/>\n</dict>"
+  PLIST_YES = "<dict>\n<key>ITSAppUsesNonExemptEncryption</key>\n<true/>\n</dict>"
+
+  # 임시 프로젝트: Info.plist 하나와 소스 파일들({상대경로 => 내용})
+  def with_project(plist, sources = {})
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "Info.plist"), plist)
+      sources.each do |rel, body|
+        FileUtils.mkdir_p(File.dirname(File.join(dir, rel)))
+        File.write(File.join(dir, rel), body)
+      end
+      yield File.join(dir, "Info.plist"), dir
+    end
+  end
+
+  def test_encryption_key_missing_is_fail
+    with_project("<dict></dict>") { |pl, dir| assert_equal :fail, AscDoctor.check_encryption(pl, dir).status }
+  end
+
+  def test_encryption_no_with_hash_only_is_ok
+    with_project(PLIST_NO, "App/Id.swift" => "import CryptoKit\nlet d = Insecure.MD5.hash(data: x)\n") do |pl, dir|
+      r = AscDoctor.check_encryption(pl, dir)
+      assert_equal :ok, r.status
+      assert_includes r.message, "해시만"
+      assert_includes r.message, "App/Id.swift:2"
+    end
+  end
+
+  def test_encryption_no_with_cipher_is_warn_with_location
+    with_project(PLIST_NO, "App/Vault.swift" => "import CryptoKit\nlet box = try AES.GCM.seal(data, using: key)\n") do |pl, dir|
+      r = AscDoctor.check_encryption(pl, dir)
+      assert_equal :warn, r.status
+      assert_includes r.message, "App/Vault.swift:2 AES.GCM"
+      assert_includes r.fix, "USES_ENCRYPTION=true"
+    end
+  end
+
+  def test_encryption_scan_ignores_comments_and_pods
+    src = { "App/A.swift" => "// AES.GCM 은 안 씀\n", "Pods/Lib/B.swift" => "AES.GCM.seal(x, using: k)\n" }
+    with_project(PLIST_NO, src) { |pl, dir| assert_equal :ok, AscDoctor.check_encryption(pl, dir).status }
+  end
+
+  def test_encryption_yes_needs_env_true
+    with_project(PLIST_YES) do |pl, dir|
+      assert_equal :warn, AscDoctor.check_encryption(pl, dir, nil).status
+      assert_equal :ok, AscDoctor.check_encryption(pl, dir, "true").status
+    end
+  end
+
+  def test_encryption_no_with_env_true_is_warn
+    with_project(PLIST_NO) { |pl, dir| assert_equal :warn, AscDoctor.check_encryption(pl, dir, "true").status }
+  end
+
+  def test_format_warn_does_not_block_submit
+    out = AscDoctor.format([AscDoctor::Result.new("enc", "암호화", :warn, "x", "y")])
+    assert_includes out, "⚠️ 암호화"
+    assert_includes out, "⚠️ 1개 확인 필요"
+    assert_includes out, "❌ 0개 · 제출 가능: 예"
   end
 end
